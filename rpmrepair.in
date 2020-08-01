@@ -1,0 +1,303 @@
+#!/bin/bash -eu
+### This file is covered by the GNU General Public License
+### version 3 or later.
+###
+### Copyright (C) 2020, ALT Linux Team
+### Author: {{{PACKAGER}}}
+
+### {{{NAME}}} {{{VERSION}}}
+### This script repacks broken RPM's for ALT-specific repo.
+
+# Defaults
+progname="${0##*/}"
+default_packager=
+scripts=0
+nosettemp=0
+noclean=0
+noarch=0
+nodeps=0
+repair=0
+#
+EOL="
+"
+backup=
+brokens=
+no_try_repair="
+AutoReq: no, noshell
+
+%set_verify_elf_method skip
+%set_verify_info_method skip
+%set_findprov_skiplist /*
+%set_debuginfo_skiplist /*
+%set_fixup_skiplist /*"
+
+
+show_version() {
+	echo "$progname {{{VERSION}}}"
+	exit 0
+}
+
+show_usage() {
+	cat <<-EOF
+	Usage: $progname [<options>...] [--] [<package.rpm>...]
+
+	Options:
+	  -a, --noarch    Use noarch data packaging method.
+	  -n, --nodeps    Drop all dependencies in created RPM.
+	  -p, --packager  Set default PACKAGER name and e-mail.
+	  -r, --repair    Try to repair packaging errors.
+	  -s, --scripts   Add scriptlets from source RPM.
+	  -t, --notemp    Do not change TMPDIR at startup.
+	  -N, --noclean   Do not cleanup work files at exit.
+	  -v, --version   Show this program version and exit.
+	  -h, --help      Show this help message and exit.
+
+	Example:
+	  $progname -p "John Doe <agent007@example.org>"
+
+	  Will be repacked all RPM's in the current directory,
+	  results will be saved to the 'repacked' sub-directory.
+	  All pre/post/preun/postun scripts will be dropped.
+
+	User manual:
+	  https://www.altlinux.org/RPM-repair (ru)
+
+	Please, report bugs to https://bugzilla.altlinux.org/
+	EOF
+	exit 0
+}
+
+fatal() {
+	echo "$progname fatal: $*" >&2
+	exit 1
+}
+
+cleanup() {
+	trap - EXIT
+	cd "$rootdir/"
+	[ $noclean -ne 0 ] ||
+		rm -rf --one-file-system -- "$workdir" \
+			"$HOME/RPM" "$TMPDIR"/*-buildroot 2>/dev/null ||:
+	[ -z "$backup" ] || mv -f -- "$backup" "$HOME/.rpmmacros"
+}
+
+field() {
+	rpm -qp --qf "%{$1}" -- "$rpmfile" ||:
+}
+
+parse_args() {
+	local s_opts="+anprstNvh"
+	local l_opts="noarch,nodeps,packager,repair,scripts"
+	      l_opts="$l_opts,notemp,noclean,version,help"
+
+	l_opts=$(getopt -n "$progname" -o "$s_opts" -l "$l_opts" -- "$@") ||
+		fatal "Invalid command-line usage, try '-h' for help."
+	eval set -- "$l_opts"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-a|--noarch)
+			noarch=1;;
+		-n|--nodeps)
+			nodeps=1;;
+		-p|--packager)
+			default_packager="${2-}"; shift;;
+		-r|--repair)
+			repair=1;;
+		-s|--scripts)
+			scripts=1;;
+		-t|--notemp)
+			nosettemp=1;;
+		-N|--noclean)
+			noclean=1;;
+		-v|--version)
+			show_version;;
+		-h|--help)
+			show_usage;;
+		--)	shift; break;;
+		*)	break;;
+		esac
+		shift
+	done
+	if [ $# -gt 0 ]; then
+		brokens="$@"
+	else
+		brokens=( $(ls -X *.rpm) )
+		[ ${#brokens[@]} -gt 0 ] ||
+			fatal "Broken RPM packages not specified."
+	fi
+}
+
+
+# Entry point
+[ "$(id -u)" != "0" ] ||
+	fatal "This program must be run without root privileges."
+rpm -q rpm-build >/dev/null ||
+	fatal "rpm-build must be installed before run this program."
+rootdir="$(pwd)"; arch="$(uname -m)"
+[ "$arch" != "i686" ] || arch="i586"
+[ ! -s "$HOME/.rpmmacros" ] ||
+	default_packager="$(grep -E "^%packager\s" -- "$HOME/.rpmmacros" |
+				tail -n1 |sed -E 's,^%packager\s+,,')"
+parse_args "$@"
+
+# Prepare environment
+if [ $nosettemp -ne 0 ]; then
+	export TMPDIR="${TMPDIR:-/tmp}"
+else
+	export TMPDIR="$HOME/tmp"
+	mkdir -p -m755 -- "$TMPDIR"
+fi
+trap cleanup EXIT
+trap 'exit 200' INT HUP TERM QUIT USR1 USR2
+workdir="$(mktemp -dt "$progname-XXXXXXXX.tmp")"
+rm -rf --one-file-system -- repacked "$HOME/RPM"
+mkdir -p -m755 -- "$HOME/RPM/SOURCES"
+if [ -f "$HOME/.rpmmacros" ]; then
+	backup="$HOME/.rpmmacros.bak"
+	cp -Lf -- "$HOME/.rpmmacros" "$backup"
+fi
+[ -n "$default_packager" ] ||
+	default_packager="{{{PACKAGER}}}"
+cat >"$HOME/.rpmmacros" <<EOF
+%_topdir	%homedir/RPM
+%_tmppath	$TMPDIR
+%packager	$default_packager
+EOF
+
+# Build RPM's
+cd "$workdir/"
+for rpm in ${brokens[@]}; do
+	rpmfile="$rootdir/$rpm"
+	archtag="ExclusiveArch: $arch"
+	fixups="AutoReq: yes$EOL"
+	requires=
+	scriptlets=
+	dirs=
+
+	# Determinate field values
+	packager="$(field PACKAGER)"
+	[ "$packager" != "(none)" ] ||
+		packager="$(rpm --eval %packager 2>/dev/null ||:)"
+	[ -n "$packager" ] ||
+		packager="$default_packager"
+	name="$(field NAME)"
+	version="$(field VERSION)"
+	release="$(field RELEASE)"
+	group="$(field GROUP)"
+	url="$(field URL)"
+	vendor="$(field VENDOR)"
+	license="$(field LICENSE)"
+	summary="$(field SUMMARY)"
+	description="$(field DESCRIPTION)"
+	[ $repair -ne 0 ] ||
+		fixups="$no_try_repair"
+	if [ $nodeps -ne 0 ]; then
+		fixups="${fixups}${EOL}%set_findreq_skiplist /*"
+	else
+		requires="$(rpm -qp --requires -- "$rpmfile" |
+			grep -vE '^rpmlib\(' |sed -E 's,^,Requires: ,g')"
+		[ -z "$requires" ] ||
+			requires="${requires}$EOL"
+	fi
+	[ $noarch -eq 0 ] ||
+		archtag="BuildArch: noarch"
+	nv="$name-$version"
+
+	# Additional dependencies
+	if [ -s "$rootdir/$name.deps" ]; then
+		if [ -z "$requires" ]; then
+			requires="$(cat "$rootdir/$name.deps")$EOL"
+		else
+			requires="${requires}$(cat "$rootdir/$name.deps")$EOL"
+		fi
+	fi
+
+	# Optional scriptlets
+	if [ -s "$rootdir/$name.scripts" ]; then
+		scriptlets="$rootdir/$name.scripts"
+	elif [ $scripts -ne 0 ]; then
+		scriptlets="$workdir/$nv.scripts"
+		rpm -qp --scripts -- "$rpmfile" >"$scriptlets"
+		if [ ! -s "$scriptlets" ]; then
+			rm -f -- "$scriptlets"
+			scriptlets=
+		fi
+	fi
+	if [ -n "$scriptlets" ]; then
+		scriptlets="$(cat "$scriptlets" |sed -E \
+			-e "s,^preinstall scriptlet \(through .*$,\n%pre,"      \
+			-e "s,^postinstall scriptlet \(through .*$,\n%post,"    \
+			-e "s,^preuninstall scriptlet \(through .*$,\n%preun,"  \
+			-e "s,^postuninstall scriptlet \(through .*$,\n%postun,")"
+	fi
+
+	# Optional directories
+	[ ! -s "$rootdir/$name.dirs" ] ||
+		dirs="$(cat "$rootdir/$name.dirs" |sed -E 's,^,%dir ,g')$EOL"
+
+	# Repack broken RPM to TAR'ball
+	mkdir -p -m755 -- "make-tar/$nv" && cd "make-tar/$nv/"
+	rpm2cpio "$rpmfile" |cpio -imdv --no-absolute-filenames
+	find . ! -type d |cut -c2- |sort > "$workdir/FILES.lst"
+	cd ..; fakeroot tar -cpvf "$HOME/RPM/SOURCES/$nv.tar" -- "$nv"
+	cd ..; [ $noclean -ne 0 ] || rm -rf --one-file-system -- make-tar
+
+	# Set build date
+	builddate="$(LC_TIME=C date "+%a %b %d %Y")"
+
+	# Create temporary SPEC-file
+	cat >"$workdir/$name.spec" <<-EOF
+	# Auto-generated spec for repack broken $rpm
+	$fixups
+
+	Name: $name
+	Version: $version
+	Release: $release
+
+	Summary: $summary
+	Group: $group
+	License: $license
+
+	Url: $url
+	Vendor: $vendor
+	Source: $name-$version.tar
+	$archtag
+
+	Packager: $packager
+
+	BuildRequires: rsync fakeroot
+	$requires
+	%description
+	$description
+
+	%prep
+	%setup
+
+	%install
+	rsync -aH ./ %buildroot/
+	$scriptlets
+
+	%files
+	${dirs}$(cat FILES.lst)
+
+	%changelog
+	* $builddate $packager $version-$release
+	- Auto-repacked from broken $rpm
+
+	EOF
+
+	# Build single RPM
+	rpm -bb -- "$name.spec"
+
+	# Cleanup
+	if [ $noclean -eq 0 ]; then
+		rm -f -- "$name.spec" "$nv.scripts"
+		rm -f -- FILES.lst "$HOME/RPM/SOURCES/$nv.tar"
+	fi
+done
+
+# Save results and exit
+[ $noarch -eq 0 ] || arch="noarch"
+mkdir -m755 -- "$rootdir/repacked"
+mv -f -- "$HOME/RPM/RPMS/$arch"/*.rpm "$rootdir/repacked/"
+exit 0
