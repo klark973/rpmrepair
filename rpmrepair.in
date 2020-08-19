@@ -235,18 +235,17 @@ for rpm in ${brokens[@]}; do
 	[ ! -s "$rootdir/$name.dirs" ] ||
 		dirs="$(cat "$rootdir/$name.dirs" |sed -E 's,^,%dir ,g')$EOL"
 
-	# Repack broken RPM to TAR'ball
+	# Unpack broken RPM
 	mkdir -p -m755 -- "make-tar/$nv" && cd "make-tar/$nv/"
 	rpm2cpio "$rpmfile" |cpio -imdv --no-absolute-filenames
 	find . ! -type d |cut -c2- |sort > "$workdir/FILES.lst"
-	cd ..; fakeroot tar -cpvf "$HOME/RPM/SOURCES/$nv.tar" -- "$nv"
-	cd ..; [ $noclean -ne 0 ] || rm -rf --one-file-system -- make-tar
 
 	# Set build date
 	builddate="$(LC_TIME=C date "+%a %b %d %Y")"
 
 	# Create temporary SPEC-file
-	cat >"$workdir/$name.spec" <<-EOF
+	specfile="$workdir/$name.spec"
+	cat >"$specfile" <<-EOF
 	# Auto-generated spec for repack broken $rpm
 	$fixups
 
@@ -278,7 +277,7 @@ for rpm in ${brokens[@]}; do
 	$scriptlets
 
 	%files
-	${dirs}$(cat FILES.lst)
+	${dirs}$(cat "$workdir/FILES.lst")
 
 	%changelog
 	* $builddate $packager $version-$release
@@ -287,6 +286,9 @@ for rpm in ${brokens[@]}; do
 	EOF
 
 	# Build single RPM
+	[ ! -s "$rootdir/$name.repair" ] || . "$rootdir/$name.repair"
+	cd ..; fakeroot tar -cpvf "$HOME/RPM/SOURCES/$nv.tar" -- "$nv"
+	cd ..; [ $noclean -ne 0 ] || rm -rf --one-file-system -- make-tar
 	rpm -bb -- "$name.spec"
 
 	# Cleanup
