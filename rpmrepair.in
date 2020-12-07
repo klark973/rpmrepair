@@ -238,7 +238,7 @@ for rpm in ${brokens[@]}; do
 	# Unpack broken RPM
 	mkdir -p -m755 -- "make-tar/$nv" && cd "make-tar/$nv/"
 	rpm2cpio "$rpmfile" |cpio -imdv --no-absolute-filenames
-	find . ! -type d |cut -c2- |sort > "$workdir/FILES.lst"
+	find . ! -type d |cut -c2- |sort |sed 's,%,%%,g' > "$workdir/FILES.lst"
 
 	# Set build date
 	builddate="$(LC_TIME=C date "+%a %b %d %Y")"
